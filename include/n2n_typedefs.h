@@ -240,6 +240,8 @@ typedef struct tuntap_dev {
 } tuntap_dev;
 
 #define SOCKET int
+#else /* #ifndef WIN32 */
+typedef u_short sa_family_t;
 #endif /* #ifndef WIN32 */
 
 
@@ -300,8 +302,10 @@ typedef struct n2n_ip_subnet {
 } n2n_ip_subnet_t;
 
 typedef struct n2n_sock {
-    uint8_t         family;            /* AF_INET or AF_INET6; or 0 if invalid */
-    uint16_t        port;              /* host order */
+    uint8_t         family;           /* AF_INET, AF_INET6 or AF_INVALID (-1, a custom #define);
+                                         mind that AF_UNSPEC (0) means auto IPv4 or IPv6 */
+    uint8_t         type;             /* for later use, usually SOCK_STREAM (1) or SOCK_DGRAM (2) */
+    uint16_t        port;             /* host order */
     union {
         uint8_t     v6[IPV6_SIZE];    /* byte sequence */
         uint8_t     v4[IPV4_SIZE];    /* byte sequence */
@@ -404,8 +408,10 @@ typedef struct n2n_REGISTER_SUPER_NAK {
 /* REGISTER_SUPER_ACK may contain extra payload (their number given by num_sn)
  * of following type describing a(nother) supernode */
 typedef struct n2n_REGISTER_SUPER_ACK_payload {
-    n2n_sock_t    sock;             /**< socket of supernode */
-    n2n_mac_t     mac;              /**< MAC of supernode */
+    // REVISIT: interim for bugfix (https://github.com/ntop/n2n/issues/1029)
+    //          remove with 4.0
+    uint8_t       sock[sizeof(uint16_t) + sizeof(uint16_t) + IPV6_SIZE]; /**< socket of supernode */
+    n2n_mac_t     mac;                                                   /**< MAC of supernode */
 } n2n_REGISTER_SUPER_ACK_payload_t;
 
 
@@ -659,7 +665,7 @@ typedef struct n2n_edge_conf {
     char                     *encrypt_key;
     int                      register_interval;      /**< Interval for supernode registration, also used for UDP NAT hole punching. */
     int                      register_ttl;           /**< TTL for registration packet when UDP NAT hole punching through supernode. */
-    in_addr_t                bind_address;           /**< The address to bind to if provided (-b) */
+    in_addr_t                bind_address;           /**< The address to bind to if provided */
     n2n_sock_t               preferred_sock;         /**< propagated local sock for better p2p in LAN (-e) */
     uint8_t                  preferred_sock_auto;    /**< indicates desired auto detect for preferred sock */
     int                      local_port;
@@ -749,7 +755,11 @@ typedef struct sn_stats {
 typedef struct node_supernode_association {
 
     n2n_mac_t                   mac;        /* mac address of an edge                          */
-    const struct sockaddr_in    sock;       /* network order socket of that edge's supernode   */
+    socklen_t                   sock_len;   /* amount of actually used space (of the following)    */
+    union {
+        struct sockaddr         sock;       /* network order socket of that edge's supernode       */
+        struct sockaddr_storage sas;        /* the actual memory for it, sockaddr can be too small */
+    };
     time_t                      last_seen;  /* time mark to keep track of purging requirements */
 
     UT_hash_handle hh;                      /* makes this structure hashable */
@@ -794,9 +804,12 @@ struct sn_community_regular_expression {
 
 
 typedef struct n2n_tcp_connection {
-    int    socket_fd;       /* file descriptor for tcp socket */
-    struct sockaddr sock;   /* network order socket */
-
+    int    socket_fd;                                     /* file descriptor for tcp socket */
+    socklen_t                   sock_len;                 /* amount of actually used space (of the following) */
+    union {
+        struct sockaddr         sock;                     /* network order socket */
+        struct sockaddr_storage sas;                      /* memory for it, can be longer than sockaddr */
+    };
     uint16_t expected;                                    /* number of bytes expected to be read */
     uint16_t position;                                    /* current position in the buffer */
     uint8_t  buffer[N2N_PKT_BUF_SIZE + sizeof(uint16_t)]; /* buffer for data collected from tcp socket incl. prepended length */
@@ -813,6 +826,7 @@ typedef struct n2n_sn {
     sn_stats_t                             stats;
     int                                    daemon;          /* If non-zero then daemonise. */
     n2n_mac_t                              mac_addr;
+    in_addr_t                              bind_address;    /* The address to bind to if provided */
     uint16_t                               lport;           /* Local UDP port to bind to. */
     uint16_t                               mport;           /* Management UDP port to bind to. */
     int                                    sock;            /* Main socket for UDP traffic with edges. */

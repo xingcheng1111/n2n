@@ -118,6 +118,19 @@ int decode_sock (n2n_sock_t * sock,
                  size_t * rem,
                  size_t * idx);
 
+// bugfix for https://github.com/ntop/n2n/issues/1029
+// REVISIT: best to be removed with 4.0
+int encode_sock_payload (uint8_t * base,
+                         size_t * idx,
+                         const n2n_sock_t * sock);
+
+// bugfix for https://github.com/ntop/n2n/issues/1029
+// REVISIT: best to be removed with 4.0
+int decode_sock_payload (n2n_sock_t * sock,
+                         const uint8_t * base,
+                         size_t * rem,
+                         size_t * idx);
+
 int encode_REGISTER (uint8_t * base,
                      size_t * idx,
                      const n2n_common_t * common,
@@ -189,6 +202,9 @@ int decode_REGISTER_SUPER_NAK (n2n_REGISTER_SUPER_NAK_t * nak,
 int fill_sockaddr (struct sockaddr * addr,
                    size_t addrlen,
                    const n2n_sock_t * sock);
+
+int fill_n2nsock (n2n_sock_t* sock,
+                  const struct sockaddr* sa);
 
 int encode_PACKET (uint8_t * base,
                    size_t * idx,

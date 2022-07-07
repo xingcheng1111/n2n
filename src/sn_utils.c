@@ -57,13 +57,13 @@ static int sort_communities (n2n_sn_t *sss,
                              time_t now);
 
 int process_mgmt (n2n_sn_t *sss,
-                         const struct sockaddr_in *sender_sock,
-                         char *mgmt_buf,
-                         size_t mgmt_size,
-                         time_t now);
+                  const struct sockaddr *sender_sock, socklen_t sock_size,
+                  char *mgmt_buf,
+                  size_t mgmt_size,
+                  time_t now);
 
 static int process_udp (n2n_sn_t *sss,
-                        const struct sockaddr_in *sender_sock,
+                        const struct sockaddr *sender_sock, socklen_t sock_size,
                         const SOCKET socket_fd,
                         uint8_t *udp_buf,
                         size_t udp_size,
@@ -700,7 +700,7 @@ static int try_forward (n2n_sn_t * sss,
             if(assoc) {
                 traceEvent(TRACE_DEBUG, "found mac address associated with a known supernode, forwarding packet to that supernode");
                 sendto_sock(sss, sss->sock,
-                            (const struct sockaddr*)&(assoc->sock),
+                            &(assoc->sock),
                             pktbuf, pktsize);
             } else {
                 // forwarding packet to all federated supernodes
@@ -745,6 +745,7 @@ int sn_init_defaults (n2n_sn_t *sss) {
     strncpy(sss->version, PACKAGE_VERSION, sizeof(n2n_version_t));
     sss->version[sizeof(n2n_version_t) - 1] = '\0';
     sss->daemon = 1; /* By defult run as a daemon. */
+    sss->bind_address = INADDR_ANY; /* any address */
     sss->lport = N2N_SN_LPORT_DEFAULT;
     sss->mport = N2N_SN_MGMT_PORT;
     sss->sock = -1;
@@ -875,7 +876,7 @@ void sn_term (n2n_sn_t *sss) {
 }
 
 void update_node_supernode_association (struct sn_community *comm,
-                                        n2n_mac_t *edgeMac, const struct sockaddr_in *sender_sock,
+                                        n2n_mac_t *edgeMac, const struct sockaddr *sender_sock, socklen_t sock_size,
                                         time_t now) {
 
     node_supernode_association_t *assoc;
@@ -883,15 +884,17 @@ void update_node_supernode_association (struct sn_community *comm,
     HASH_FIND(hh, comm->assoc, edgeMac, sizeof(n2n_mac_t), assoc);
     if(!assoc) {
         // create a new association
-        assoc = (node_supernode_association_t*)malloc(sizeof(node_supernode_association_t));
+        assoc = (node_supernode_association_t*)calloc(1, sizeof(node_supernode_association_t));
         if(assoc) {
             memcpy(&(assoc->mac), edgeMac, sizeof(n2n_mac_t));
-            memcpy((struct sockaddr_in*)&(assoc->sock), sender_sock, sizeof(struct sockaddr_in));
+            memcpy(&(assoc->sock), sender_sock, sock_size);
+            assoc->sock_len = sock_size;
             assoc->last_seen = now;
             HASH_ADD(hh, comm->assoc, mac, sizeof(n2n_mac_t), assoc);
         } else {
             // already there, update socket and time only
-            memcpy((struct sockaddr_in*)&(assoc->sock), sender_sock, sizeof(struct sockaddr_in));
+            memcpy(&(assoc->sock), sender_sock, sock_size);
+            assoc->sock_len = sock_size;
             assoc->last_seen = now;
         }
     }
@@ -1508,7 +1511,7 @@ static int sort_communities (n2n_sn_t *sss,
  *
  */
 static int process_udp (n2n_sn_t * sss,
-                        const struct sockaddr_in *sender_sock,
+                        const struct sockaddr *sender_sock, socklen_t sock_size,
                         const SOCKET socket_fd,
                         uint8_t * udp_buf,
                         size_t udp_size,
@@ -1521,10 +1524,10 @@ static int process_udp (n2n_sn_t * sss,
     uint8_t             from_supernode;
     peer_info_t         *sn = NULL;
     n2n_sock_t          sender;
+    n2n_sock_t          *orig_sender;
     macstr_t            mac_buf;
     macstr_t            mac_buf2;
     n2n_sock_str_t      sockbuf;
-    char                buf[32];
     uint8_t             hash_buf[16] = {0}; /* always size of 16 (max) despite the actual value of N2N_REG_SUP_HASH_CHECK_LEN (<= 16) */
 
     struct sn_community *comm, *tmp;
@@ -1533,9 +1536,12 @@ static int process_udp (n2n_sn_t * sss,
     int                 skip_add;
     time_t              any_time = 0;
 
-    traceEvent(TRACE_DEBUG, "processing incoming UDP packet [len: %lu][sender: %s:%u]",
-               udp_size, intoa(ntohl(sender_sock->sin_addr.s_addr), buf, sizeof(buf)),
-               ntohs(sender_sock->sin_port));
+    memset(&sender, 0, sizeof(n2n_sock_t));
+    fill_n2nsock(&sender, sender_sock);
+    orig_sender = &sender;
+
+    traceEvent(TRACE_DEBUG, "processing incoming UDP packet [len: %lu][sender: %s]",
+               udp_size, sock_to_cstr(sockbuf, &sender));
 
     /* check if header is unencrypted. the following check is around 99.99962 percent reliable.
      * it heavily relies on the structure of packet's common part
@@ -1651,13 +1657,6 @@ static int process_udp (n2n_sn_t * sss,
         }
     }
 
-    /* REVISIT: when UDP/IPv6 is supported we will need a flag to indicate which
-     * IP transport version the packet arrived on. May need to UDP sockets. */
-    memset(&sender, 0, sizeof(n2n_sock_t));
-    sender.family = AF_INET; /* UDP socket was opened PF_INET v4 */
-    sender.port = ntohs(sender_sock->sin_port);
-    memcpy(&(sender.addr.v4), &(sender_sock->sin_addr.s_addr), IPV4_SIZE);
-
     from_supernode = cmn.flags & N2N_FLAGS_FROM_SUPERNODE;
     if(from_supernode) {
         skip_add = SN_ADD_SKIP;
@@ -1719,9 +1718,7 @@ static int process_udp (n2n_sn_t * sss,
                 /* We are going to add socket even if it was not there before */
                 cmn2.flags |= N2N_FLAGS_SOCKET | N2N_FLAGS_FROM_SUPERNODE;
 
-                pkt.sock.family = AF_INET;
-                pkt.sock.port = ntohs(sender_sock->sin_port);
-                memcpy(pkt.sock.addr.v4, &(sender_sock->sin_addr.s_addr), IPV4_SIZE);
+                memcpy(&pkt.sock, &sender, sizeof(sender));
 
                 rec_buf = encbuf;
                 /* Re-encode the header. */
@@ -1804,9 +1801,7 @@ static int process_udp (n2n_sn_t * sss,
                     /* We are going to add socket even if it was not there before */
                     cmn2.flags |= N2N_FLAGS_SOCKET | N2N_FLAGS_FROM_SUPERNODE;
 
-                    reg.sock.family = AF_INET;
-                    reg.sock.port = ntohs(sender_sock->sin_port);
-                    memcpy(reg.sock.addr.v4, &(sender_sock->sin_addr.s_addr), IPV4_SIZE);
+                    memcpy(&reg.sock, &sender, sizeof(sender));
 
                     /* Re-encode the header. */
                     encode_REGISTER(encbuf, &encx, &cmn2, &reg);
@@ -1965,9 +1960,7 @@ static int process_udp (n2n_sn_t * sss,
 
             ack.lifetime = reg_lifetime(sss);
 
-            ack.sock.family = AF_INET;
-            ack.sock.port = ntohs(sender_sock->sin_port);
-            memcpy(ack.sock.addr.v4, &(sender_sock->sin_addr.s_addr), IPV4_SIZE);
+            memcpy(&ack.sock, &sender, sizeof(sender));
 
             /* Add sender's data to federation (or update it) */
             if(comm->is_federation == IS_FEDERATION) {
@@ -1997,7 +1990,12 @@ static int process_udp (n2n_sn_t * sss,
                                                                             * We need to allow for a little extra time because supernodes sometimes exceed
                                                                             * their SN_ACTIVE time before they get re-registred to. */
                 if(((++num)*REG_SUPER_ACK_PAYLOAD_ENTRY_SIZE) > REG_SUPER_ACK_PAYLOAD_SPACE) break; /* no more space available in REGISTER_SUPER_ACK payload */
-                memcpy(&(payload->sock), &(peer->sock), sizeof(n2n_sock_t));
+
+                // bugfix for https://github.com/ntop/n2n/issues/1029
+                // REVISIT: best to be removed with 4.0 (replace with encode_sock)
+                idx = 0;
+                encode_sock_payload(payload->sock, &idx, &(peer->sock));
+
                 memcpy(payload->mac, peer->mac_addr, sizeof(n2n_mac_t));
                 // shift to next payload entry
                 payload++;
@@ -2036,7 +2034,7 @@ static int process_udp (n2n_sn_t * sss,
                         encode_buf(ackbuf, &encx, hash_buf /* no matter what content */, N2N_REG_SUP_HASH_CHECK_LEN);
                     }
                 }
-                sendto_sock(sss, socket_fd, (struct sockaddr *)sender_sock, ackbuf, encx);
+                sendto_sock(sss, socket_fd, sender_sock, ackbuf, encx);
 
                 traceEvent(TRACE_DEBUG, "Tx REGISTER_SUPER_NAK for %s",
                            macaddr_str(mac_buf, reg.edgeMac));
@@ -2048,9 +2046,7 @@ static int process_udp (n2n_sn_t * sss,
                     //     NULL comm and from_supernode parameter)
                     // exception: do not forward auto ip draw
                     if(!is_null_mac(reg.edgeMac)) {
-                        reg.sock.family = AF_INET;
-                        reg.sock.port = ntohs(sender_sock->sin_port);
-                        memcpy(reg.sock.addr.v4, &(sender_sock->sin_addr.s_addr), IPV4_SIZE);
+                        memcpy(&reg.sock, &sender, sizeof(sender));
 
                         cmn2.pc = n2n_register_super;
                         encode_REGISTER_SUPER(ackbuf, &encx, &cmn2, &reg);
@@ -2109,7 +2105,7 @@ static int process_udp (n2n_sn_t * sss,
                         }
                     }
 
-                    sendto_sock(sss, socket_fd, (struct sockaddr *)sender_sock, ackbuf, encx);
+                    sendto_sock(sss, socket_fd, sender_sock, ackbuf, encx);
 
                     traceEvent(TRACE_DEBUG, "Tx REGISTER_SUPER_ACK for %s [%s]",
                                macaddr_str(mac_buf, reg.edgeMac),
@@ -2117,7 +2113,7 @@ static int process_udp (n2n_sn_t * sss,
                 } else {
                     // this is an edge with valid authentication registering with another supernode, so ...
                     // 1- ... associate it with that other supernode
-                    update_node_supernode_association(comm, &(reg.edgeMac), sender_sock, now);
+                    update_node_supernode_association(comm, &(reg.edgeMac), sender_sock, sock_size, now);
                     // 2- ... we can delete it from regular list if present (can happen)
                     HASH_FIND_PEER(comm->edges, reg.edgeMac, peer);
                     if(peer != NULL) {
@@ -2188,17 +2184,10 @@ static int process_udp (n2n_sn_t * sss,
             n2n_sock_str_t                   sockbuf1;
             n2n_sock_str_t                   sockbuf2;
             macstr_t                         mac_buf1;
-            n2n_sock_t                       sender;
-            n2n_sock_t                       *orig_sender;
             int                              i;
             uint8_t                          dec_tmpbuf[REG_SUPER_ACK_PAYLOAD_SPACE];
             n2n_REGISTER_SUPER_ACK_payload_t *payload;
-
-            memset(&sender, 0, sizeof(n2n_sock_t));
-            sender.family = AF_INET;
-            sender.port = ntohs(sender_sock->sin_port);
-            memcpy(&(sender.addr.v4), &(sender_sock->sin_addr.s_addr), IPV4_SIZE);
-            orig_sender = &sender;
+            n2n_sock_t                       payload_sock;
 
             memset(&ack, 0, sizeof(n2n_REGISTER_SUPER_ACK_t));
 
@@ -2241,7 +2230,14 @@ static int process_udp (n2n_sn_t * sss,
                 payload = (n2n_REGISTER_SUPER_ACK_payload_t *)dec_tmpbuf;
                 for(i = 0; i < ack.num_sn; i++) {
                     skip_add = SN_ADD;
-                    tmp = add_sn_to_list_by_mac_or_sock(&(sss->federation->edges), &(payload->sock), payload->mac, &skip_add);
+
+                    // bugfix for https://github.com/ntop/n2n/issues/1029
+                    // REVISIT: best to be removed with 4.0
+                    idx = 0;
+                    rem = sizeof(payload->sock);
+                    decode_sock_payload(&payload_sock, payload->sock, &rem, &idx);
+
+                    tmp = add_sn_to_list_by_mac_or_sock(&(sss->federation->edges), &(payload_sock), payload->mac, &skip_add);
                     // other supernodes communicate via standard udp socket
                     tmp->socket_fd = sss->sock;
 
@@ -2278,12 +2274,6 @@ static int process_udp (n2n_sn_t * sss,
             struct peer_info          *peer;
             n2n_sock_str_t            sockbuf;
             macstr_t                  mac_buf;
-            n2n_sock_t                sender;
-
-            memset(&sender, 0, sizeof(n2n_sock_t));
-            sender.family = AF_INET;
-            sender.port = ntohs(sender_sock->sin_port);
-            memcpy(&(sender.addr.v4), &(sender_sock->sin_addr.s_addr), IPV4_SIZE);
 
             memset(&nak, 0, sizeof(n2n_REGISTER_SUPER_NAK_t));
 
@@ -2400,9 +2390,9 @@ static int process_udp (n2n_sn_t * sss,
                 pi.aflags = 0;
                 memcpy(pi.mac, query.targetMac, sizeof(n2n_mac_t));
                 memcpy(pi.srcMac, sss->mac_addr, sizeof(n2n_mac_t));
-                pi.sock.family = AF_INET;
-                pi.sock.port = ntohs(sender_sock->sin_port);
-                memcpy(pi.sock.addr.v4, &(sender_sock->sin_addr.s_addr), IPV4_SIZE);
+
+                memcpy(&pi.sock, &sender, sizeof(sender));
+
                 pi.load = sn_selection_criterion_gather_data(sss);
 
                 snprintf(pi.version, sizeof(pi.version), "%s", sss->version);
@@ -2418,7 +2408,7 @@ static int process_udp (n2n_sn_t * sss,
                     }
                 }
 
-                sendto_sock(sss, socket_fd, (struct sockaddr *)sender_sock, encbuf, encx);
+                sendto_sock(sss, socket_fd, sender_sock, encbuf, encx);
 
                 traceEvent(TRACE_DEBUG, "Tx PONG to %s",
                            macaddr_str(mac_buf, query.srcMac));
@@ -2460,7 +2450,7 @@ static int process_udp (n2n_sn_t * sss,
                                               time_stamp());
                     }
                     // back to sender, be it edge or supernode (which will forward to edge)
-                    sendto_sock(sss, socket_fd, (struct sockaddr *)sender_sock, encbuf, encx);
+                    sendto_sock(sss, socket_fd, sender_sock, encbuf, encx);
 
                     traceEvent(TRACE_DEBUG, "Tx PEER_INFO to %s",
                                macaddr_str(mac_buf, query.srcMac));
@@ -2520,7 +2510,7 @@ static int process_udp (n2n_sn_t * sss,
             if(peer != NULL) {
                 if((comm->is_federation == IS_NO_FEDERATION) && (!is_null_mac(pi.srcMac))) {
                     // snoop on the information to use for supernode forwarding (do not wait until first remote REGISTER_SUPER)
-                    update_node_supernode_association(comm, &(pi.mac), sender_sock, now);
+                    update_node_supernode_association(comm, &(pi.mac), sender_sock, sock_size, now);
 
                     // this is a PEER_INFO for one of the edges conencted to this supernode, forward,
                     // i.e. re-assemble (memcpy of udpbuf to encbuf could be sufficient as well)
@@ -2609,12 +2599,12 @@ int run_sn_loop (n2n_sn_t *sss) {
 
             // external udp
             if(FD_ISSET(sss->sock, &socket_mask)) {
-                struct sockaddr_in sender_sock;
-                socklen_t i;
+                struct sockaddr_storage sas;
+                struct sockaddr *sender_sock = (struct sockaddr*)&sas;
+                socklen_t ss_size = sizeof(sas);
 
-                i = sizeof(sender_sock);
                 bread = recvfrom(sss->sock, (void *)pktbuf, N2N_SN_PKTBUF_SIZE, 0 /*flags*/,
-                                 (struct sockaddr *)&sender_sock, (socklen_t *)&i);
+                                 sender_sock, &ss_size);
 
                 if((bread < 0)
 #ifdef WIN32
@@ -2634,7 +2624,7 @@ int run_sn_loop (n2n_sn_t *sss) {
                 // we have a datagram to process...
                 if(bread > 0) {
                     // ...and the datagram has data (not just a header)
-                    process_udp(sss, &sender_sock, sss->sock, pktbuf, bread, now);
+                    process_udp(sss, sender_sock, ss_size, sss->sock, pktbuf, bread, now);
                 }
             }
 
@@ -2652,17 +2642,16 @@ int run_sn_loop (n2n_sn_t *sss) {
                     continue;
 
                 if(FD_ISSET(conn->socket_fd, &socket_mask)) {
+                    struct sockaddr_storage sas;
+                    struct sockaddr *sender_sock = (struct sockaddr*)&sas;
+                    socklen_t ss_size = sizeof(sas);
 
-                    struct sockaddr_in sender_sock;
-                    socklen_t i;
-
-                    i = sizeof(sender_sock);
                     bread = recvfrom(conn->socket_fd,
                                      conn->buffer + conn->position, conn->expected - conn->position, 0 /*flags*/,
-                                     (struct sockaddr *)&sender_sock, (socklen_t *)&i);
+                                     sender_sock, &ss_size);
 
                     if(bread <= 0) {
-                        traceEvent(TRACE_INFO, "closing tcp connection to [%s]", sock_to_cstr(sockbuf, (n2n_sock_t*)&sender_sock));
+                        traceEvent(TRACE_INFO, "closing tcp connection to [%s]", sock_to_cstr(sockbuf, (n2n_sock_t*)sender_sock));
                         traceEvent(TRACE_DEBUG, "recvfrom() returns %d and sees errno %d (%s)", bread, errno, strerror(errno));
 #ifdef WIN32
                         traceEvent(TRACE_DEBUG, "WSAGetLastError(): %u", WSAGetLastError());
@@ -2677,14 +2666,14 @@ int run_sn_loop (n2n_sn_t *sss) {
                             // the prepended length has been read, preparing for the packet
                             conn->expected += be16toh(*(uint16_t*)(conn->buffer));
                             if(conn->expected > N2N_SN_PKTBUF_SIZE) {
-                                traceEvent(TRACE_INFO, "closing tcp connection to [%s]", sock_to_cstr(sockbuf, (n2n_sock_t*)&sender_sock));
+                                traceEvent(TRACE_INFO, "closing tcp connection to [%s]", sock_to_cstr(sockbuf, (n2n_sock_t*)sender_sock));
                                 traceEvent(TRACE_DEBUG, "too many bytes in tcp packet expected");
                                 close_tcp_connection(sss, conn);
                                 continue;
                             }
                         } else {
                             // full packet read, handle it
-                            process_udp(sss, (struct sockaddr_in*)&(conn->sock), conn->socket_fd,
+                            process_udp(sss, &(conn->sock), conn->sock_len, conn->socket_fd,
                                              conn->buffer + sizeof(uint16_t), conn->position - sizeof(uint16_t), now);
 
                             // reset, await new prepended length
@@ -2705,42 +2694,45 @@ int run_sn_loop (n2n_sn_t *sss) {
 
             // accept new incoming tcp connection
             if(FD_ISSET(sss->tcp_sock, &socket_mask)) {
-                struct sockaddr_in sender_sock;
-                socklen_t i;
+                struct sockaddr_storage sas;
+                struct sockaddr *sender_sock = (struct sockaddr*)&sas;
+                socklen_t ss_size = sizeof(sas);
 
-                i = sizeof(sender_sock);
                 if((HASH_COUNT(sss->tcp_connections) + 4) < FD_SETSIZE) {
-                    tmp_sock = accept(sss->tcp_sock, (struct sockaddr *)&sender_sock, (socklen_t *)&i);
+                    tmp_sock = accept(sss->tcp_sock, sender_sock, &ss_size);
+                    // REVISIT: should we error out if ss_size returns bigger than before? can this ever happen?
                     if(tmp_sock >= 0) {
-                        conn = (n2n_tcp_connection_t*)malloc(sizeof(n2n_tcp_connection_t));
+                        conn = (n2n_tcp_connection_t*)calloc(1, sizeof(n2n_tcp_connection_t));
                         if(conn) {
                             conn->socket_fd = tmp_sock;
-                            memcpy(&(conn->sock), &sender_sock, sizeof(struct sockaddr_in));
+                            memcpy(&(conn->sock), sender_sock, ss_size);
+                            conn->sock_len = ss_size;
                             conn->inactive = 0;
                             conn->expected = sizeof(uint16_t);
                             conn->position = 0;
                             HASH_ADD_INT(sss->tcp_connections, socket_fd, conn);
                             traceEvent(TRACE_INFO, "accepted incoming TCP connection from [%s]",
-                                                   sock_to_cstr(sockbuf, (n2n_sock_t*)&sender_sock));
+                                                   sock_to_cstr(sockbuf, (n2n_sock_t*)sender_sock));
                         }
                     }
                 } else {
                         // no space to store the socket for a new connection, close immediately
                         traceEvent(TRACE_DEBUG, "denied incoming TCP connection from [%s] due to max connections limit hit",
-                                                sock_to_cstr(sockbuf, (n2n_sock_t*)&sender_sock));
+                                                sock_to_cstr(sockbuf, (n2n_sock_t*)sender_sock));
                 }
             }
 #endif /* N2N_HAVE_TCP */
 
             // handle management port input
             if(FD_ISSET(sss->mgmt_sock, &socket_mask)) {
-                struct sockaddr_in sender_sock;
-                size_t i;
+                struct sockaddr_storage sas;
+                struct sockaddr *sender_sock = (struct sockaddr*)&sas;
+                socklen_t ss_size = sizeof(sas);
 
-                i = sizeof(sender_sock);
                 bread = recvfrom(sss->mgmt_sock, (void *)pktbuf, N2N_SN_PKTBUF_SIZE, 0 /*flags*/,
-                                 (struct sockaddr *)&sender_sock, (socklen_t *)&i);
+                                 sender_sock, &ss_size);
 
+                // REVISIT: should we error out if ss_size returns bigger than before? can this ever happen?
                 if(bread <= 0) {
                     traceEvent(TRACE_ERROR, "recvfrom() failed %d errno %d (%s)", bread, errno, strerror(errno));
                     *sss->keep_running = 0;
@@ -2748,7 +2740,7 @@ int run_sn_loop (n2n_sn_t *sss) {
                 }
 
                 // we have a datagram to process
-                process_mgmt(sss, &sender_sock, (char *)pktbuf, bread, now);
+                process_mgmt(sss, sender_sock, ss_size, (char *)pktbuf, bread, now);
             }
 
         } else {

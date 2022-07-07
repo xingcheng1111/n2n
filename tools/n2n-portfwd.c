@@ -26,6 +26,7 @@
 #define SOCKET_TIMEOUT          2
 #define INFO_INTERVAL           5
 
+// REVISIT: may become obsolete
 #ifdef WIN32
 #define STDIN_FILENO            _fileno(stdin)
 #endif
@@ -80,12 +81,30 @@ static void term_handler (int sig) {
 
 
 // -------------------------------------------------------------------------------------------------------
+// PLATFORM-DEPENDANT CODE
 
 
 SOCKET connect_to_management_port (n2n_portfwd_conf_t *ppp) {
 
     SOCKET ret;
     struct sockaddr_in sock_addr;
+
+#if defined(WIN32)
+    // Windows requires a call to WSAStartup() before it can work with sockets
+    WORD wVersionRequested;
+    WSADATA wsaData;
+    int err;
+
+    // Use the MAKEWORD(lowbyte, highbyte) macro declared in Windef.h
+    wVersionRequested = MAKEWORD(2, 2);
+
+    err = WSAStartup(wVersionRequested, &wsaData);
+    if (err != 0) {
+        // tell the user that we could not find a usable Winsock DLL
+        traceEvent(TRACE_ERROR, "WSAStartup failed with error: %d\n", err);
+        return -1;
+    }
+#endif
 
     ret = socket (PF_INET, SOCK_DGRAM, 0);
     if((int)ret < 0)
@@ -138,10 +157,12 @@ int get_port_from_json (uint16_t *port, json_object_t *json, char *key, int tag,
 
 
 // -------------------------------------------------------------------------------------------------------
+// PLATFORM-DEPENDANT CODE
 
 
+#if !defined(WIN32)
 // taken from https://web.archive.org/web/20170407122137/http://cc.byexamples.com/2007/04/08/non-blocking-user-input-in-loop-without-ncurses/
-int kbhit () {
+int _kbhit () {
 
     struct timeval tv;
     fd_set fds;
@@ -154,6 +175,7 @@ int kbhit () {
 
     return FD_ISSET(STDIN_FILENO, &fds);
 }
+#endif
 
 
 // -------------------------------------------------------------------------------------------------------
@@ -218,6 +240,7 @@ int main (int argc, char* argv[]) {
 
     n2n_portfwd_conf_t ppp;
     uint8_t c;
+    char *p;
     SOCKET sock;
     size_t msg_len;
     char udp_buf[N2N_PKT_BUF_SIZE];
@@ -292,7 +315,7 @@ reset_main_loop:
     // read answer packet by packet which are only accepted if a corresponding request was sent before
     // of which we know about by having set the related tag, tag_info
     // a valid sock address indicates that we have seen a valid answer to the info request
-    while(keep_running && !kbhit()) {
+    while(keep_running && !_kbhit()) {
         // current time
         now = time(NULL);
 
@@ -321,7 +344,7 @@ reset_main_loop:
                 if((msg_len > 0) && (msg_len < sizeof(udp_buf))) {
                     // make sure it is a string and replace all newlines with spaces
                     udp_buf[msg_len] = '\0';
-                    for (char *p = udp_buf; (p = strchr(p, '\n')) != NULL; p++) *p = ' ';
+                    for (p = udp_buf; (p = strchr(p, '\n')) != NULL; p++) *p = ' ';
                     traceEvent(TRACE_DEBUG, "received '%s' from management port", udp_buf);
 
                     // handle the answer, json needs to be freed later

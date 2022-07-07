@@ -2160,7 +2160,7 @@ void edge_read_from_tap (n2n_edge_t * eee) {
 
 
 /** handle a datagram from the main UDP socket to the internet. */
-void process_udp (n2n_edge_t *eee, const struct sockaddr_in *sender_sock, const SOCKET in_sock,
+void process_udp (n2n_edge_t *eee, const struct sockaddr *sender_sock, const SOCKET in_sock,
                  uint8_t *udp_buf, size_t udp_size, time_t now) {
 
     n2n_common_t          cmn; /* common fields in the packet header */
@@ -2190,9 +2190,9 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr_in *sender_sock, const 
         // TCP expects that we know our comm partner and does not deliver the sender
         memcpy(&sender, &(eee->curr_sn->sock), sizeof(struct sockaddr_in));
     else {
-        sender.family = AF_INET; /* UDP socket was opened PF_INET v4 */
-        sender.port = ntohs(sender_sock->sin_port);
-        memcpy(&(sender.addr.v4), &(sender_sock->sin_addr.s_addr), IPV4_SIZE);
+        // REVISIT: type conversion back and forth, choose a consistent approach throughout whole code,
+        //          i.e. stick with more general sockaddr as long as possible and narrow only if required
+        fill_n2nsock(&sender, sender_sock);
     }
     /* The packet may not have an orig_sender socket spec. So default to last
      * hop as sender. */
@@ -2414,6 +2414,7 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr_in *sender_sock, const 
                 uint8_t tmpbuf[REG_SUPER_ACK_PAYLOAD_SPACE];
                 char ip_tmp[N2N_EDGE_SN_HOST_SIZE];
                 n2n_REGISTER_SUPER_ACK_payload_t *payload;
+                n2n_sock_t payload_sock;
                 int i;
                 int skip_add;
 
@@ -2474,15 +2475,22 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr_in *sender_sock, const 
                 // from here on, 'sn' gets used differently
                 for(i = 0; i < ra.num_sn; i++) {
                     skip_add = SN_ADD;
-                    sn = add_sn_to_list_by_mac_or_sock(&(eee->conf.supernodes), &(payload->sock), payload->mac, &skip_add);
+
+                    // bugfix for https://github.com/ntop/n2n/issues/1029
+                    // REVISIT: best to be removed with 4.0
+                    idx = 0;
+                    rem = sizeof(payload->sock);
+                    decode_sock_payload(&payload_sock, payload->sock, &rem, &idx);
+
+                    sn = add_sn_to_list_by_mac_or_sock(&(eee->conf.supernodes), &payload_sock, payload->mac, &skip_add);
 
                     if(skip_add == SN_ADD_ADDED) {
                         sn->ip_addr = calloc(1, N2N_EDGE_SN_HOST_SIZE);
                         if(sn->ip_addr != NULL) {
-                            inet_ntop(payload->sock.family,
-                                      (payload->sock.family == AF_INET) ? (void*)&(payload->sock.addr.v4) : (void*)&(payload->sock.addr.v6),
+                            inet_ntop(payload_sock.family,
+                                      (payload_sock.family == AF_INET) ? (void*)&(payload_sock.addr.v4) : (void*)&(payload_sock.addr.v6),
                                       sn->ip_addr, N2N_EDGE_SN_HOST_SIZE - 1);
-                            sprintf(ip_tmp, "%s:%u", (char*)sn->ip_addr, (uint16_t)(payload->sock.port));
+                            sprintf(ip_tmp, "%s:%u", (char*)sn->ip_addr, (uint16_t)(payload_sock.port));
                             memcpy(sn->ip_addr, ip_tmp, sizeof(ip_tmp));
                         }
                         sn_selection_criterion_default(&(sn->selection_criterion));
@@ -2703,18 +2711,18 @@ int fetch_and_eventually_process_data (n2n_edge_t *eee, SOCKET sock,
 
     ssize_t bread = 0;
 
+    struct sockaddr_storage sas;
+    struct sockaddr *sender_sock = (struct sockaddr*)&sas;
+    socklen_t ss_size = sizeof(sas);
+
     if((!eee->conf.connect_tcp)
 #ifndef SKIP_MULTICAST_PEERS_DISCOVERY
     || (sock == eee->udp_multicast_sock)
 #endif
       ) {
         // udp
-        struct sockaddr_in sender_sock;
-        socklen_t i;
-
-        i = sizeof(sender_sock);
         bread = recvfrom(sock, pktbuf, N2N_PKT_BUF_SIZE, 0 /*flags*/,
-                         (struct sockaddr *)&sender_sock, (socklen_t *)&i);
+                         sender_sock, &ss_size);
 
         if((bread < 0)
 #ifdef WIN32
@@ -2733,18 +2741,14 @@ int fetch_and_eventually_process_data (n2n_edge_t *eee, SOCKET sock,
         // we have a datagram to process...
         if(bread > 0) {
             // ...and the datagram has data (not just a header)
-            process_udp(eee, &sender_sock, sock, pktbuf, bread, now);
+            process_udp(eee, sender_sock, sock, pktbuf, bread, now);
         }
 
     } else {
         // tcp
-        struct sockaddr_in sender_sock;
-        socklen_t i;
-
-        i = sizeof(sender_sock);
         bread = recvfrom(sock,
                          pktbuf + *position, *expected - *position, 0 /*flags*/,
-                        (struct sockaddr *)&sender_sock, (socklen_t *)&i);
+                        sender_sock, &ss_size);
         if((bread <= 0) && (errno)) {
             traceEvent(TRACE_ERROR, "recvfrom() failed %d errno %d (%s)", bread, errno, strerror(errno));
 #ifdef WIN32
@@ -2768,7 +2772,7 @@ int fetch_and_eventually_process_data (n2n_edge_t *eee, SOCKET sock,
                 }
             } else {
                 // full packet read, handle it
-                process_udp(eee, (struct sockaddr_in*)&sender_sock, sock,
+                process_udp(eee, sender_sock, sock,
                                  pktbuf + sizeof(uint16_t), *position - sizeof(uint16_t), now);
                 // reset, await new prepended length
                 *expected = sizeof(uint16_t);

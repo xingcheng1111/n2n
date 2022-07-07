@@ -255,6 +255,9 @@ int encode_sock (uint8_t * base,
     switch(sock->family) {
         case AF_INET: {
             f = 0;
+            if(sock->type == SOCK_STREAM) {
+                f |= 0x4000;
+            }
             retval += encode_uint16(base, idx, f);
             retval += encode_uint16(base, idx, sock->port);
             retval += encode_buf(base, idx, sock->addr.v4, IPV4_SIZE);
@@ -263,6 +266,9 @@ int encode_sock (uint8_t * base,
 
         case AF_INET6: {
             f = 0x8000;
+            if(sock->type == SOCK_STREAM) {
+                f |= 0x4000;
+            }
             retval += encode_uint16(base, idx, f);
             retval += encode_uint16(base, idx, sock->port);
             retval += encode_buf(base, idx, sock->addr.v6, IPV6_SIZE);
@@ -286,22 +292,72 @@ int decode_sock (n2n_sock_t * sock,
     uint16_t f = 0;
 
     decode_uint16(&f, base, rem, idx);
+    decode_uint16(&(sock->port), base, rem, idx);
 
     if(f & 0x8000) {
-
-        /* IPv6 */
+        // IPv6
         sock->family = AF_INET6;
-        decode_uint16(&(sock->port), base, rem, idx);
         decode_buf(sock->addr.v6, IPV6_SIZE, base, rem, idx);
     } else {
-        /* IPv4 */
+        // IPv4
         sock->family = AF_INET;
-        decode_uint16(&(sock->port), base, rem, idx);
         memset(sock->addr.v6, 0, IPV6_SIZE); /* so memcmp() works for equality. */
         decode_buf(sock->addr.v4, IPV4_SIZE, base, rem, idx);
     }
 
+    if(f & 0x4000) {
+        // TCP
+        sock->type = SOCK_STREAM;
+    } else {
+        // UDP
+        sock->type = SOCK_DGRAM;
+    }
+
     return (idx - idx0);
+}
+
+
+// bugfix for https://github.com/ntop/n2n/issues/1029
+// REVISIT: best to be removed with 4.0
+int encode_sock_payload (uint8_t * base,
+                         size_t * idx,
+                         const n2n_sock_t * sock) {
+
+    int retval = 0;
+
+    retval += encode_uint8(base, idx, sock->family);
+    retval += encode_uint8(base, idx, 0); // blank
+    retval += encode_uint8(base, idx, sock->port & 0x00FF);
+    retval += encode_uint8(base, idx, sock->port >> 8);
+    // copy full address field length
+    retval += encode_buf(base, idx, sock->addr.v6, IPV6_SIZE);
+
+    return retval;
+}
+
+
+// bugfix for https://github.com/ntop/n2n/issues/1029
+// REVISIT: best to be removed with 4.0
+int decode_sock_payload (n2n_sock_t * sock,
+                         const uint8_t * base,
+                         size_t * rem,
+                         size_t * idx) {
+
+    int retval = 0;
+    uint8_t port_low = 0;
+    uint8_t port_high = 0;
+
+    retval += decode_uint8(&(sock->family), base, rem, idx);
+    ++(*idx); // skip blank
+    --(*rem);
+    ++retval;
+    retval += decode_uint8(&port_low, base, rem, idx);
+    retval += decode_uint8(&port_high, base, rem, idx);
+    sock->port = ((uint16_t)port_high << 8) + port_low;
+    // copy full address field length
+    retval += decode_buf(sock->addr.v6, IPV6_SIZE, base, rem, idx);
+
+    return retval;
 }
 
 
@@ -600,8 +656,42 @@ int fill_sockaddr (struct sockaddr * addr,
             retval = 0;
         }
     }
+    if(AF_INET6 == sock->family) {
+        if(addrlen >= sizeof(struct sockaddr_in6)) {
+            struct sockaddr_in6 * si = (struct sockaddr_in6 *)addr;
+            si->sin6_family = sock->family;
+            si->sin6_port = htons(sock->port);
+            memcpy(&(si->sin6_addr.s6_addr), sock->addr.v6, IPV6_SIZE);
+            retval = 0;
+        }
+    }
 
     return retval;
+}
+
+
+// fills struct sockaddr's data into n2n_sock
+int fill_n2nsock (n2n_sock_t* sock, const struct sockaddr* sa) {
+
+    sock->family = *(sa_family_t*)sa;
+    switch(sock->family) {
+        case AF_INET: {
+            sock->port = ntohs(((struct sockaddr_in*)sa)->sin_port);
+            memcpy(sock->addr.v4, &((struct sockaddr_in*)sa)->sin_addr.s_addr, sizeof(struct in_addr));
+            break;
+        }
+        case AF_INET6: {
+            sock->port = ntohs(((struct sockaddr_in6*)sa)->sin6_port);
+            memcpy(sock->addr.v6, &((struct sockaddr_in6*)sa)->sin6_addr.s6_addr, sizeof(struct in6_addr));
+            break;
+        }
+        default:
+            sock->family = AF_INVALID;
+            return -1;
+            break; /* well, ... */
+    }
+
+    return 0;
 }
 
 
